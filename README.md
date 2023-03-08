@@ -71,3 +71,6 @@ Just makes calls to the OpenAI API using the key specified in settings.
 ---
 
 💻❤🍲 by [Patrik Žúdel](https://twitter.com/PatrikZero)
+
+xxx
+

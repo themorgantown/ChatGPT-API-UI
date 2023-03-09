@@ -56,7 +56,7 @@ You are a therapist. ETC...`;
       </button>
       <div class="py-1 select-none">
         <p class="text-left px-8 font-bold text-xl ">
-          PatrikZero's <br />
+           <br />
         </p>
         <p class="text-center font-bold text-2xl  leading-4 pb-2">ChatGPT UI</p>
       </div>

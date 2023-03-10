@@ -32,6 +32,7 @@
   import MoreIcon from "./assets/more.svg";
   import SendIcon from "./assets/send.svg";
   import Paragraph from "./renderers/Paragraph.svelte";
+  import { encodeTokens } from "./Encoder";
 
   // DEFINES && SETUP
   let MSG_TYPES = {
@@ -55,14 +56,9 @@
   let input: string = "";
   let chatContainer: HTMLElement;
   let moreButtonsToggle: boolean = false;
+  let waitingForResponse: boolean = false;
+  let lastMsgTokenCount: number = 0;
 
-  const errorMessage: ChatCompletionRequestMessage[] = [
-    {
-      role: "assistant",
-      content:
-        "There was an error. Maybe the API key is wrong? Or the servers could be down?",
-    },
-  ];
   newChat();
 
   // Functions
@@ -165,7 +161,7 @@
     if (configuration === null) {
       setHistory([
         {
-          role: "assistant",
+          role: "system",
           content: "Enter your OpenAI API key in the Settings.",
         },
       ]);
@@ -178,20 +174,30 @@
 
   //   Sends request to OpenAI API with and streams the response data.
   //   @param {ChatCompletionRequestMessage[]} msg - Array of messages. Probably history + new message.
-  function createStream(msg: ChatCompletionRequestMessage[]) {
+  function createStream(
+    msg: ChatCompletionRequestMessage[],
+    recursive: boolean = false
+  ) {
+    waitingForResponse = true;
     let tickCounter = 0;
     let ticks = false;
     let currentHistory = $conversations[$chosenConversationId].history;
     let currentConvId = $chosenConversationId;
+    let originalMsg = msg;
     let roleMsg: ChatCompletionRequestMessage = {
       role: $defaultAssistantRole.type as ChatCompletionRequestMessageRoleEnum,
       content: $conversations[$chosenConversationId].assistantRole,
     };
     msg = [roleMsg, ...msg];
-    console.log("Message:");
-    console.log(msg);
-    let done = false;
     console.log("Creating stream");
+    console.log("New message:");
+    console.log(msg);
+    if (recursive === false) {
+      console.log("Attempted message tokens");
+      lastMsgTokenCount = countMessagesTokens(msg);
+      console.log(lastMsgTokenCount);
+    }
+    let done = false;
     currentHistory = [...currentHistory];
     let source = new SSE("https://api.openai.com/v1/chat/completions", {
       headers: {
@@ -213,6 +219,7 @@
         let text = payload.choices[0].delta.content;
         if (text == undefined) typing = !typing;
         if (text != undefined) {
+          waitingForResponse = false;
           let msgTicks = countTicks(text);
           tickCounter += msgTicks;
           if (msgTicks == 0) tickCounter = 0;
@@ -244,7 +251,14 @@
           ],
           currentConvId
         );
-        estimateTokens(msg);
+        msg = [
+          ...msg,
+          {
+            role: "assistant",
+            content: streamText,
+          },
+        ];
+        addTokens(countMessagesTokens(msg));
         streamText = "";
         done = true;
         console.log("Stream closed");
@@ -255,51 +269,82 @@
     source.addEventListener("error", (e) => {
       if (done) return;
       configuration = null;
-      setHistory([...currentHistory, ...errorMessage]);
-      console.error(e);
-      console.log("Stream closed on error");
+      let errorData;
+      try {
+        errorData = JSON.parse(e.data);
+      } catch {
+        errorData = {
+          error: {
+            message:
+              "The servers are probably down. (Or your internet connection)",
+          },
+        };
+      }
+      let errorMessage = errorData.error.message;
+
+      // Handle messages over the token limit
       source.close();
+      waitingForResponse = false;
+      if (errorMessage.includes("maximum context length")) {
+        if (originalMsg.length > 1) {
+          console.log(errorMessage);
+          console.log("Token limit reached, attempting to shorten history");
+          originalMsg.shift(); // Removes the oldest msg
+          createStream(originalMsg, true);
+          return;
+        }
+      }
+
+      console.log("Stream closed on error");
+      console.error(e);
+      setHistory([
+        ...currentHistory,
+        {
+          role: "system",
+          content: errorMessage,
+        },
+      ]);
     });
 
     source.stream();
   }
 
-  //   Estimates the number of tokens from the character count of the messages in msg.
+  //   Calculates the tokens contained in a msg[] using gpt-3-encoder.
+  //   Including the tokens of the latest streamed message. (streamText)
   //   @param {ChatCompletionRequestMessage[]} msg - Array of messages. Probably history + new message.
-  function estimateTokens(msg: ChatCompletionRequestMessage[]) {
-    let chars = 0;
+  function countMessagesTokens(msg: ChatCompletionRequestMessage[]): number {
+    let tokenCount = 0;
     msg.map((m) => {
-      chars += m.content.length;
+      let historyTokens = encodeTokens(m.content);
+      tokenCount += historyTokens.length;
     });
-    chars += streamText.length;
-    let tokens = chars / 4;
+    console.log("Gpt-3-counter Tokens in msg: " + tokenCount);
+    console.log(msg);
+    return tokenCount;
+  }
+
+  //   Adds the tokens to the current conversation and the global counter.
+  //   @param {number} tokenCount : Number of tokens.
+  function addTokens(tokenCount: number) {
     let conv = $conversations;
     conv[$chosenConversationId].conversationTokens =
-      conv[$chosenConversationId].conversationTokens + tokens;
+      conv[$chosenConversationId].conversationTokens + tokenCount;
     conversations.set(conv);
-    combinedTokens.set($combinedTokens + tokens);
+    combinedTokens.set($combinedTokens + tokenCount);
   }
 
   //   Sends request to OpenAI API without streaming text.
   //   @param {ChatCompletionRequestMessage[]} msg - Array of messages. Probably history + new message.
   async function sendRequest(msg: ChatCompletionRequestMessage[]) {
     {
-      msg = [
-        {
-          role: "system",
-          content: $conversations[$chosenConversationId].assistantRole,
-        },
-        ...msg,
-      ];
       console.log("Sending request");
       const response = await openai
         .createChatCompletion({
           model: "gpt-3.5-turbo",
           messages: msg,
         })
-        .catch((error: Error) => {
+        .catch((error) => {
           configuration = null;
-          setHistory(errorMessage);
           console.error(error);
         });
       if (response) countTokens(response.data.usage);
@@ -314,14 +359,15 @@
     if ($conversations[currentConvId].title !== "") {
       return;
     }
-    let response = await sendRequest([
+    let msg: ChatCompletionRequestMessage[] = [
       { role: "user", content: currentInput },
       {
         role: "user",
         content:
           "Excluding this summarization request, summarize my previous request in a natural way in max 4 words.",
       },
-    ]);
+    ];
+    let response = await sendRequest(msg);
     if (response) {
       let message = response.data.choices[0].message.content;
       setTitle(message.toString(), currentConvId);
@@ -382,12 +428,13 @@
   //   Adds the number of tokens from a request to the combined tokens.
   //   @param {Object} usage - An object containing the total tokens used in a request.
   function countTokens(usage) {
+    console.log("Reported tokens from response: ");
+    console.log(usage);
     let conv = $conversations;
     conv[$chosenConversationId].conversationTokens =
       conv[$chosenConversationId].conversationTokens + usage.total_tokens;
     conversations.set(conv);
     combinedTokens.set($combinedTokens + usage.total_tokens);
-    console.log("Counted tokens: " + usage.total_tokens);
   }
 
   afterUpdate(() => {
@@ -424,9 +471,17 @@
       <div class="flex flex-col ">
         {#each $conversations[$chosenConversationId].history as message, i}
           <div
-            class="message relative inline-block {message.role === 'assistant'
-              ? 'bg-hover2'
-              : 'bg-primary'}  px-2 py-5"
+            class="message relative inline-block px-2 py-5 pb-2 {`${(() => {
+              switch (message.role) {
+                case 'assistant':
+                  return 'bg-hover2';
+                case 'user':
+                  return 'bg-primary';
+                case 'system':
+                  return 'bg-error';
+              }
+              // This below might just be the ugliest thing I've ever seen.
+            })()}`}"
           >
             <button
               class="deleteButton"
@@ -436,7 +491,7 @@
             >
               <img class="icon-white w-8" alt="Delete" src={DeleteIcon} />
             </button>
-            <div class="px-3 md:px-20 text-[1rem]">
+            <div class="m-auto md:max-w-2xl px-4 py-0 text-[1rem]">
               <SvelteMarkdown
                 renderers={{
                   code: CodeRenderer,
@@ -452,72 +507,91 @@
             </div>
           </div>
         {/each}
+        {#if waitingForResponse}
+          <div class="bg-hover2 w-full flex justify-center py-5">
+            <div
+              class="border-[4px] border-solid border-chat w-6 h-6 rounded-full border-t-[4px] border-t-good2 animate-spin"
+            />
+          </div>
+        {/if}
       </div>
     </div>
 
     <!-- CHAT INPUT WINDOW BEGINNING -->
-    <div class="flex p-2 bg-primary mt-auto">
-      <textarea
-        class="w-full min-h-[96px] h-24 rounded p-2 mx-1 mr-0 rounded-r-none bg-chat resize-none focus: outline-none"
-        placeholder="Type your message"
-        on:keydown={(event) => {
-          if (event.key === "Enter") {
-            if (event.shiftKey) {
-              return;
-            } else {
-              sendMessage(MSG_TYPES.WITH_HISTORY);
+    <div class="flex-col bg-primary">
+      {#if lastMsgTokenCount >= 3500}
+        <p class="px-4 pt-1">
+          Last message too long ({lastMsgTokenCount} tokens), may start losing context
+          after 4096 tokens. Summarization advised.
+        </p>
+      {/if}
+      <div class="flex p-2 bg-primary mt-auto">
+        <textarea
+          class="w-full min-h-[96px] h-24 rounded p-2 mx-1 mr-0 rounded-r-none bg-chat resize-none md:resize-y focus: outline-none"
+          placeholder="Type your message"
+          on:keydown={(event) => {
+            if (event.key === "Enter") {
+              if (event.shiftKey) {
+                return;
+              } else {
+                event.preventDefault();
+                sendMessage(MSG_TYPES.WITH_HISTORY);
+              }
             }
-          }
-        }}
-        bind:value={input}
-      />
-      <div class="flex relative">
-        <button
-          class="bg-chat rounded py-2 px-4 mx-1 ml-0 rounded-l-none"
-          on:click={() => {
-            sendMessage(MSG_TYPES.WITH_HISTORY);
           }}
-        >
-          <img
-            class="icon-white min-w-[24px] w-[24px]"
-            alt="Send"
-            src={SendIcon}
-          />
-        </button>
-        <button
-          class="bg-hover2 rounded min-w-[40px] mx-1 flex justify-center align-middle items-center"
-          on:click={() => {
-            moreButtonsToggle = !moreButtonsToggle;
-          }}
-        >
-          <img class="icon-white w-[32px]" alt="More" src={MoreIcon} />
-        </button>
-        <div
-          class={`otherButtons ${
-            moreButtonsToggle
-              ? "translate-x-0 static"
-              : "hidden md:flex absolute translate-x-[600px] "
-          } flex transition-all duration-100`}
-        >
+          bind:value={input}
+        />
+        <div class="flex relative">
           <button
-            class="bg-good2 rounded py-2 px-4 mx-1"
+            class="bg-chat rounded py-2 px-4 mx-1 ml-0 rounded-l-none"
             on:click={() => {
-              sendMessage(MSG_TYPES.WITHOUT_HISTORY);
-            }}>Send without history</button
+              sendMessage(MSG_TYPES.WITH_HISTORY);
+            }}
           >
-          <div class="flex-col hidden md:flex max-h-[96px]">
+            <img
+              class="icon-white min-w-[24px] w-[24px]"
+              alt="Send"
+              src={SendIcon}
+            />
+          </button>
+          <button
+            class="bg-hover2 rounded min-w-[40px] mx-1 flex justify-center align-middle items-center"
+            on:click={() => {
+              moreButtonsToggle = !moreButtonsToggle;
+            }}
+          >
+            <img class="icon-white w-[32px]" alt="More" src={MoreIcon} />
+          </button>
+          <div
+            class={`otherButtons ${
+              moreButtonsToggle
+                ? "translate-x-0 static"
+                : "hidden md:flex absolute translate-x-[600px] "
+            } flex transition-all duration-100`}
+          >
             <button
-              class="bg-good2 flex-1 rounded mb-2 py-2 px-4 mx-1"
+              title="Sending a message without prior conversation history can save token costs."
+              class="bg-good2 rounded py-2 px-4 mx-1"
               on:click={() => {
-                sendMessage(MSG_TYPES.SUMMARIZE);
-              }}>Summarize</button
+                sendMessage(MSG_TYPES.WITHOUT_HISTORY);
+              }}>Send without history</button
             >
-            <button
-              class="bg-good2 flex-1 rounded py-2 px-4 mx-1"
-              on:click={() => {
-                addAssitantMessage();
-              }}>Assistant</button
-            >
+            <div class="flex-col hidden md:flex ">
+              <button
+                title="Summarizing conversations saves token costs and is ideal for preserving context in lengthy discussions."
+                class="bg-good2 flex-1 rounded mb-2 py-2 px-4 mx-1"
+                on:click={() => {
+                  sendMessage(MSG_TYPES.SUMMARIZE);
+                }}>Summarize</button
+              >
+              <button
+                title="Injecting assistant message from input into history; useful for jailbreaks."
+                class="bg-good2 flex-1 rounded py-2 px-4 mx-1"
+                on:click={() => {
+                  addAssitantMessage();
+                }}>Assistant</button
+              >
+            </div>
           </div>
         </div>
       </div>

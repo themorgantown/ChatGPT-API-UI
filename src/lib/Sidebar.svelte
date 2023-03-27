@@ -9,6 +9,8 @@
     defaultAssistantRole,
     type Conversation,
     type DefaultAssistantRole,
+    type GptModel,
+    gptModel,
   } from "../stores/stores";
   import CloseIcon from "../assets/close.svg";
   const dispatch = createEventDispatcher();
@@ -25,9 +27,6 @@ You are a therapist. ETC...`;
   }
 
   function deleteConversation(i: number) {
-    if ($conversations.length === 1) {
-      return;
-    }
     let conv = $conversations.filter((value, index) => index !== i);
     if (i < $chosenConversationId || i == $chosenConversationId) {
       if ($chosenConversationId !== 0) {
@@ -35,6 +34,10 @@ You are a therapist. ETC...`;
       }
     }
     conversations.set(conv);
+    if ($conversations.length === 0) {
+      dispatch("new-chat");
+      chosenConversationId.set(0);
+    }
   }
 </script>
 
@@ -117,7 +120,14 @@ You are a therapist. ETC...`;
         on:click={openSettings}
         class="flex border border-white/50 py-3 px-3 items-center font-bold gap-3 rounded-md hover:bg-hover transition-colors duration-200 cursor-pointer text-sm mt-auto"
       >
-        Settings {$apiKey === null ? "(Insert API key)" : ""}
+        <div class="flex justify-between w-full items-center">
+          <p>
+            Settings {$apiKey === null ? "(Insert API key)" : ""}
+          </p>
+          <p class=" text-xs text-chat">
+            {$apiKey === null ? "" : $gptModel.name}
+          </p>
+        </div>
       </button>
     </nav>
   </div>

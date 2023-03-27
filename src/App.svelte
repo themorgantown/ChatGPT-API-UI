@@ -19,6 +19,9 @@
     type DefaultAssistantRole,
     combinedTokens,
     defaultAssistantRole,
+    gptModel,
+    streamMessages,
+    type GptModel,
   } from "./stores/stores";
   import CodeRenderer from "./renderers/Code.svelte";
   import EmRenderer from "./renderers/Em.svelte";
@@ -145,9 +148,11 @@
   // Creates a new conversation
   function newChat() {
     console.log("New chat");
-    if ($conversations[$conversations.length - 1].history.length === 0) {
-      chosenConversationId.set($conversations.length - 1);
-      return;
+    if ($conversations.length > 0) {
+      if ($conversations[$conversations.length - 1].history.length === 0) {
+        chosenConversationId.set($conversations.length - 1);
+        return;
+      }
     }
     input = "";
     let newConversation: Conversation = {
@@ -211,7 +216,7 @@
       },
       method: "POST",
       payload: JSON.stringify({
-        model: "gpt-3.5-turbo",
+        model: $gptModel.code,
         messages: msg,
         stream: true,
       }),
@@ -340,20 +345,68 @@
 
   //   Sends request to OpenAI API without streaming text.
   //   @param {ChatCompletionRequestMessage[]} msg - Array of messages. Probably history + new message.
-  async function sendRequest(msg: ChatCompletionRequestMessage[]) {
-    {
-      console.log("Sending request");
-      const response = await openai
-        .createChatCompletion({
-          model: "gpt-3.5-turbo",
-          messages: msg,
-        })
-        .catch((error) => {
-          configuration = null;
-          console.error(error);
-        });
-      if (response) countTokens(response.data.usage);
-      return response;
+  async function sendRequest(
+    msg: ChatCompletionRequestMessage[],
+    chatMsg: boolean = true
+  ) {
+    console.log("Sending request");
+    console.log("Sent message:");
+    console.log(msg);
+    let currentConvId = $chosenConversationId;
+    let originalMsg = msg;
+    const response = await openai
+      .createChatCompletion({
+        model: $gptModel.code,
+        messages: msg,
+      })
+      .catch((error) => {
+        configuration = null;
+        let errorData = error.response;
+        if (!errorData) {
+          errorData = {
+            data: {
+              error: {
+                message:
+                  "The servers are probably down. (Or your internet connection)",
+              },
+            },
+          };
+        }
+        console.log(errorData);
+        let errorMessage = errorData.data.error.message;
+        let currentHistory = $conversations[currentConvId].history;
+        if (chatMsg) {
+          setHistory([
+            ...currentHistory,
+            {
+              role: "system",
+              content: errorMessage,
+            },
+          ]);
+        }
+        waitingForResponse = false;
+        return null;
+      });
+    return response;
+  }
+
+  async function sendMessageNoStream(msg: ChatCompletionRequestMessage[]) {
+    waitingForResponse = true;
+    let currentConvId = $chosenConversationId;
+    let roleMsg: ChatCompletionRequestMessage = {
+      role: $defaultAssistantRole.type as ChatCompletionRequestMessageRoleEnum,
+      content: $conversations[currentConvId].assistantRole,
+    };
+    msg = [roleMsg, ...msg];
+    let currentHistory = $conversations[currentConvId].history;
+    const response = await sendRequest(msg);
+    if (response) {
+      waitingForResponse = false;
+      const message = response.data.choices[0].message;
+      console.log("Response message:");
+      console.log(message);
+      setHistory([...currentHistory, message], currentConvId);
+      lastMsgTokenCount = countTokens(response.data.usage);
     }
   }
 
@@ -372,9 +425,10 @@
           "Excluding this summarization request, summarize my previous request in a natural way in max 4 words.",
       },
     ];
-    let response = await sendRequest(msg);
+    let response = await sendRequest(msg, false);
     if (response) {
       let message = response.data.choices[0].message.content;
+      countTokens(response.data.usage);
       setTitle(message.toString(), currentConvId);
     }
     console.log("Title created");
@@ -418,21 +472,14 @@
         break;
     }
 
-    // Send request
-    // OLD: Using sendRequest
-    // const response = await sendRequest(outgoingMessage);
-    // if (response) {
-    //   const message = response.data.choices[0].message;
-    //   setHistory([...currentHistory, message]);
-    //   countTokens(response.data.usage);
-    // }
-    createStream(outgoingMessage);
+    if ($streamMessages) createStream(outgoingMessage);
+    else sendMessageNoStream(outgoingMessage);
     createTitle(currentInput);
   }
 
   //   Adds the number of tokens from a request to the combined tokens.
   //   @param {Object} usage - An object containing the total tokens used in a request.
-  function countTokens(usage) {
+  function countTokens(usage): number {
     console.log("Reported tokens from response: ");
     console.log(usage);
     let conv = $conversations;
@@ -440,6 +487,7 @@
       conv[$chosenConversationId].conversationTokens + usage.total_tokens;
     conversations.set(conv);
     combinedTokens.set($combinedTokens + usage.total_tokens);
+    return usage.total_tokens;
   }
 
   afterUpdate(() => {
@@ -524,10 +572,10 @@
 
     <!-- CHAT INPUT WINDOW BEGINNING -->
     <div class="flex-col bg-primary">
-      {#if lastMsgTokenCount >= 3500}
+      {#if lastMsgTokenCount >= $gptModel.tokenLimit - 500}
         <p class="px-4 pt-1">
           Last message too long ({lastMsgTokenCount} tokens), may start losing context
-          after 4096 tokens. Summarization advised.
+          after {$gptModel.tokenLimit} tokens. Summarization advised.
         </p>
       {/if}
       <div class="flex p-2 bg-primary mt-auto">
